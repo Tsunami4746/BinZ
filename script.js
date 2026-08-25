@@ -1,3 +1,5 @@
+const API_BASE = "http://localhost:5050";
+
 const scrapItems = [
   { name: "Newspaper", rate: "₹14/kg", category: "normal", note: "Market rate tracked for household paper.", icon: "newspaper" },
   { name: "Glass bottles", rate: "₹2/kg", category: "normal", note: "Accepted with mixed scrap pickup.", icon: "wine" },
@@ -24,6 +26,7 @@ const defaultLeaders = [
 const state = {
   coins: Number(localStorage.getItem("coins") || 5),
   firstName: localStorage.getItem("firstName") || "Guest",
+  email: localStorage.getItem("email") || "",
   entries: JSON.parse(localStorage.getItem("impactEntries") || "[]"),
   tickets: Number(localStorage.getItem("tickets") || 0)
 };
@@ -40,15 +43,74 @@ function qsa(selector) {
 }
 
 function setStatus(node, message, isError = false) {
+  if (!node) return;
   node.textContent = message;
   node.style.color = isError ? "#b33b27" : "#174e2a";
 }
 
+// Thin wrapper around fetch: JSON in, JSON out, throws with the backend's message on failure.
+async function apiRequest(path, options = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    ...options
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || "Request failed");
+  }
+  return data;
+}
+
 function updateCoins(value) {
-  state.coins = Math.max(0, Number(value));
+  state.coins = Math.max(0, Number(value) || 0);
   localStorage.setItem("coins", String(state.coins));
   qs("#coinBalance").textContent = state.coins;
-  renderLeaderboard();
+  refreshLeaderboard();
+}
+
+// Awards coins server-side when a user is logged in; otherwise falls back to local-only state.
+async function awardCoins(delta) {
+  if (state.email) {
+    try {
+      const data = await apiRequest("/rewardCoins", {
+        method: "POST",
+        body: JSON.stringify({ email: state.email, coins: delta })
+      });
+      updateCoins(data.coins);
+      return;
+    } catch (error) {
+      console.error("Reward sync failed, falling back to local:", error);
+    }
+  }
+  updateCoins(state.coins + delta);
+}
+
+async function refreshLeaderboard() {
+  try {
+    const data = await apiRequest("/leaderboard");
+    const serverLeaders = (data.leaderboard || []).map((user) => ({
+      name: user.firstName || "Player",
+      coins: user.coins
+    }));
+    renderLeaderboardRows(serverLeaders);
+  } catch (error) {
+    // Backend unreachable — fall back to the local demo leaderboard.
+    const currentName = state.firstName && state.firstName !== "Guest" ? state.firstName : "Guest";
+    renderLeaderboardRows([...defaultLeaders, { name: currentName, coins: state.coins }]);
+  }
+}
+
+function renderLeaderboardRows(list) {
+  const merged = [...list].sort((a, b) => b.coins - a.coins).slice(0, 4);
+  const medals = ["🥇", "🥈", "🥉"];
+
+  qs("#leaderboardRows").innerHTML = merged.map((user, index) => `
+    <div class="leader-row">
+      <span>${index < 3 ? `<span class="rank-medal" aria-label="Rank ${index + 1}">${medals[index]}</span>` : `<span class="rank-plain">${index + 1}.</span>`}</span>
+      <span>${user.name}</span>
+      <span>${user.coins}</span>
+    </div>
+  `).join("");
 }
 
 function scrapIcon(item) {
@@ -154,22 +216,6 @@ function renderImpact() {
   });
 }
 
-function renderLeaderboard() {
-  const currentName = state.firstName && state.firstName !== "Guest" ? state.firstName : "Guest";
-  const merged = [...defaultLeaders, { name: currentName, coins: state.coins }]
-    .sort((a, b) => b.coins - a.coins)
-    .slice(0, 4);
-  const medals = ["🥇", "🥈", "🥉"];
-
-  qs("#leaderboardRows").innerHTML = merged.map((user, index) => `
-    <div class="leader-row">
-      <span>${index < 3 ? `<span class="rank-medal" aria-label="Rank ${index + 1}">${medals[index]}</span>` : `<span class="rank-plain">${index + 1}.</span>`}</span>
-      <span>${user.name}</span>
-      <span>${user.coins}</span>
-    </div>
-  `).join("");
-}
-
 function openDrawer(id) {
   qsa(".drawer").forEach((drawer) => {
     drawer.classList.remove("open");
@@ -194,12 +240,22 @@ function seedToday() {
   if (!input.value) input.valueAsDate = new Date();
 }
 
-function init() {
+async function init() {
   qs("#coinBalance").textContent = state.coins;
   seedToday();
   renderScrap();
   renderImpact();
-  renderLeaderboard();
+  await refreshLeaderboard();
+
+  // If we already know who this browser is, pull their live coin balance from the server.
+  if (state.email) {
+    try {
+      const data = await apiRequest(`/getCoins/${encodeURIComponent(state.email)}`);
+      updateCoins(data.coins);
+    } catch (error) {
+      console.error("Could not sync coin balance from server:", error);
+    }
+  }
 
   qsa(".tab").forEach((button) => {
     button.addEventListener("click", () => {
@@ -223,7 +279,7 @@ function init() {
     }
   });
 
-  qs("#pickupForm").addEventListener("submit", (event) => {
+  qs("#pickupForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const phone = qs("#phoneInput").value.trim();
     if (!/^[6-9]\d{9}$/.test(phone)) {
@@ -231,8 +287,26 @@ function init() {
       return;
     }
     localStorage.setItem("phoneNumber", phone);
-    updateCoins(state.coins + 2);
-    setStatus(qs("#pickupStatus"), "Pickup booked. Demo wallet awarded +2 Z-Coins.");
+    setStatus(qs("#pickupStatus"), "Booking pickup...");
+
+    try {
+      if (state.email) {
+        await apiRequest("/storePhoneNumber", {
+          method: "POST",
+          body: JSON.stringify({ email: state.email, phoneNumber: phone })
+        });
+      }
+      await apiRequest("/sendSMS", {
+        method: "POST",
+        body: JSON.stringify({ phoneNumber: phone })
+      });
+    } catch (error) {
+      // Non-fatal — pickup can still be recorded even if the notification step fails.
+      console.error("Pickup notification failed:", error);
+    }
+
+    await awardCoins(2);
+    setStatus(qs("#pickupStatus"), "Pickup booked. +2 Z-Coins awarded.");
   });
 
   qs("#impactForm").addEventListener("submit", (event) => {
@@ -245,20 +319,38 @@ function init() {
     if (!entry.solid && !entry.ewaste) return;
     state.entries.push(entry);
     localStorage.setItem("impactEntries", JSON.stringify(state.entries));
-    updateCoins(state.coins + Math.ceil(entry.solid + entry.ewaste));
+    awardCoins(Math.ceil(entry.solid + entry.ewaste));
     qs("#solidWaste").value = "";
     qs("#eWaste").value = "";
     renderImpact();
   });
 
-  qs("#uploadForm").addEventListener("submit", (event) => {
+  qs("#uploadForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const reward = Math.floor(Math.random() * 6) + 5;
+    const file = qs("#videoInput").files[0];
+    if (!file) {
+      setStatus(qs("#uploadStatus"), "Choose a cleanup video first.", true);
+      return;
+    }
+    if (!state.email) {
+      setStatus(qs("#uploadStatus"), "Create an account first so we know who to reward.", true);
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append("video", file);
+    formData.append("email", state.email);
+
     setStatus(qs("#uploadStatus"), "Processing cleanup proof...");
-    setTimeout(() => {
-      updateCoins(state.coins + reward);
-      setStatus(qs("#uploadStatus"), `Coins rewarded: ${reward} Z-Coins`);
-    }, 650);
+    try {
+      const response = await fetch(`${API_BASE}/uploadVideo`, { method: "POST", body: formData });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.message || "Upload failed");
+      updateCoins(data.coins);
+      setStatus(qs("#uploadStatus"), data.message);
+    } catch (error) {
+      setStatus(qs("#uploadStatus"), error.message || "Could not process video.", true);
+    }
   });
 
   qs("#videoInput").addEventListener("change", (event) => {
@@ -266,25 +358,77 @@ function init() {
     qs("#fileLabel").textContent = file ? file.name : "Choose cleanup video";
   });
 
-  qs("#authForm").addEventListener("submit", (event) => {
+  qs("#authForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    state.firstName = qs("#firstName").value.trim() || "Guest";
-    localStorage.setItem("firstName", state.firstName);
-    localStorage.setItem("lastName", qs("#lastName").value.trim());
-    localStorage.setItem("email", qs("#email").value.trim().toLowerCase());
-    localStorage.setItem("state", qs("#state").value.trim());
-    updateCoins(Math.max(state.coins, 5));
-    setStatus(qs("#authStatus"), `Welcome, ${state.firstName}. Account saved for this demo.`);
+    const firstName = qs("#firstName").value.trim();
+    const lastName = qs("#lastName").value.trim();
+    const email = qs("#email").value.trim().toLowerCase();
+    const stateValue = qs("#state").value.trim();
+
+    if (!firstName || !lastName || !email || !stateValue) {
+      setStatus(qs("#authStatus"), "First name, last name, email and state are required.", true);
+      return;
+    }
+
+    setStatus(qs("#authStatus"), "Saving account...");
+
+    try {
+      let data;
+      try {
+        // New account.
+        data = await apiRequest("/register", {
+          method: "POST",
+          body: JSON.stringify({ firstName, lastName, email, state: stateValue })
+        });
+        state.firstName = data.User.firstName;
+        state.email = data.User.email;
+        var serverCoins = data.User.coins;
+      } catch (registerError) {
+        // Already registered on this backend — treat as a login by email.
+        data = await apiRequest("/login", {
+          method: "POST",
+          body: JSON.stringify({ email })
+        });
+        state.firstName = data.firstName;
+        state.email = data.email;
+        var serverCoins = data.coins;
+      }
+
+      localStorage.setItem("firstName", state.firstName);
+      localStorage.setItem("lastName", lastName);
+      localStorage.setItem("email", state.email);
+      localStorage.setItem("state", stateValue);
+
+      updateCoins(serverCoins);
+      setStatus(qs("#authStatus"), `Welcome, ${state.firstName}. Account synced with server.`);
+    } catch (error) {
+      setStatus(qs("#authStatus"), error.message || "Could not reach server.", true);
+    }
   });
 
-  qs("#ticketForm").addEventListener("submit", (event) => {
+  qs("#ticketForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const id = `EW-${Math.floor(100000 + Math.random() * 900000)}`;
-    state.tickets += 1;
-    localStorage.setItem("tickets", String(state.tickets));
-    updateCoins(state.coins + 3);
-    renderImpact();
-    setStatus(qs("#ticketStatus"), `Ticket ${id} submitted. Demo wallet awarded +3 Z-Coins.`);
+    const descriptionField = qs("#ticketDescription");
+
+    setStatus(qs("#ticketStatus"), "Submitting ticket...");
+    try {
+      const data = await apiRequest("/submit-ticket", {
+        method: "POST",
+        body: JSON.stringify({
+          name: state.firstName,
+          email: state.email || "guest@example.com",
+          eWasteType: qs("#ticketType").value,
+          description: descriptionField ? descriptionField.value.trim() : ""
+        })
+      });
+      state.tickets += 1;
+      localStorage.setItem("tickets", String(state.tickets));
+      await awardCoins(3);
+      renderImpact();
+      setStatus(qs("#ticketStatus"), `Ticket ${data.ticketID} submitted. +3 Z-Coins awarded.`);
+    } catch (error) {
+      setStatus(qs("#ticketStatus"), error.message || "Could not submit ticket.", true);
+    }
   });
 
   qsa("[data-open]").forEach((button) => {
